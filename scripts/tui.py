@@ -99,8 +99,11 @@ def get_model_capabilities(cfg: Dict[str, Any], model_name: str) -> Dict[str, An
             with open(cache_file, 'r') as f:
                 system_flags = json.load(f)
             
-            # Check for new 'gpus' key (migration) or empty gpus list for NVIDIA
-            if ("gpus" not in system_flags or not system_flags["gpus"]) and system_flags.get("vendor") == "NVIDIA":
+            # Re-probe if cache is stale: no vendor detected, or NVIDIA with no gpus list
+            stale = not system_flags.get("vendor") or (
+                system_flags.get("vendor") == "NVIDIA" and not system_flags.get("gpus")
+            )
+            if stale:
                 # Stale cache, re-probe
                 system_flags = probe_gpu_support(server_path, debug=False)
                 with open(cache_file, 'w') as f:

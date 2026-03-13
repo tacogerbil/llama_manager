@@ -134,10 +134,10 @@ class MainWindow(QMainWindow):
 
         # Initialize launch page models
         if self.models:
-            # Don't auto-select to avoid parsing repeatedly at startup
-            # User must select a model manually
             self.model_combo.setCurrentIndex(-1)
-            # self.on_model_changed(self.model_combo.currentText())
+
+        # Probe GPU at startup — nvidia-smi works even without bin_path set
+        self._startup_probe_gpu()
 
     def create_sidebar(self):
         self.sidebar = QWidget()
@@ -503,6 +503,54 @@ class MainWindow(QMainWindow):
         # Update VRAM display with new projector
         self.update_vram_display()
     
+    def _startup_probe_gpu(self):
+        """Probe GPU at startup and show result in status bar. nvidia-smi works without bin_path."""
+        import json
+        import socket
+        from pathlib import Path
+        from scripts.detectors import probe_gpu_support
+        from scripts.config import CACHE_DIR
+
+        hostname = socket.gethostname()
+        cache_file = CACHE_DIR / f"{hostname}_system_flags.json"
+
+        # Use cached flags if valid, otherwise probe now
+        system_flags = None
+        if cache_file.exists():
+            try:
+                with open(cache_file) as f:
+                    system_flags = json.load(f)
+                # Re-probe if cache has no GPU info
+                if not system_flags.get("vendor"):
+                    system_flags = None
+            except Exception:
+                system_flags = None
+
+        if system_flags is None:
+            server_bin = os.path.join(self.cfg.get("bin_path", ""), "llama-server")
+            if os.name == "nt":
+                server_bin += ".exe"
+            system_flags = probe_gpu_support(server_bin if self.cfg.get("bin_path") else None)
+            try:
+                with open(cache_file, "w") as f:
+                    json.dump(system_flags, f, indent=4)
+            except Exception:
+                pass
+
+        # Show GPU summary in status bar
+        vendor = system_flags.get("vendor")
+        if vendor:
+            gpus = system_flags.get("gpus", [])
+            if gpus:
+                names = ", ".join(f"{g['name']} ({g['vram_gb']:.1f} GB)" for g in gpus)
+            else:
+                names = f"{system_flags.get('name', 'Unknown')} ({system_flags.get('vram_gb', 0):.1f} GB)"
+            self.status_lbl.setText(f"GPU: {names}")
+            self.status_lbl.setStyleSheet("color: #198754; font-size: 12px; padding: 0 10px;")
+        else:
+            self.status_lbl.setText("No GPU detected")
+            self.status_lbl.setStyleSheet("color: #ffc107; font-size: 12px; padding: 0 10px;")
+
     def _on_paths_saved(self):
         """Reload model list and reset selection after bin/model paths are changed."""
         self.models = list_models(self.cfg)
@@ -513,6 +561,8 @@ class MainWindow(QMainWindow):
         self.model_combo.blockSignals(False)
         self.current_model = None
         self.model_info_lbl.setText("Select a model...")
+        # Re-probe with potentially new bin_path
+        self._startup_probe_gpu()
 
     def refresh_model_list(self):
         """Reload model list from disk without losing current state."""
