@@ -512,9 +512,20 @@ class MainWindow(QMainWindow):
         - Only writes cache when bin_path is set (full probe), so model selection
           re-probes correctly if bin_path was empty at startup.
         """
+        try:
+            self.__startup_probe_gpu_impl()
+        except Exception as e:
+            import traceback
+            print(f"[GPU PROBE ERROR] {e}")
+            traceback.print_exc()
+            self.status_lbl.setText(f"GPU probe failed: {e}")
+            self.status_lbl.setStyleSheet("color: #dc3545; font-size: 12px; padding: 0 10px;")
+
+    def __startup_probe_gpu_impl(self):
         hostname = socket.gethostname()
         cache_file = CACHE_DIR / f"{hostname}_system_flags.json"
         bin_path = self.cfg.get("bin_path", "")
+        print(f"[GPU PROBE] hostname={hostname}, bin_path={repr(bin_path)}")
 
         if bin_path:
             # Full probe: GPU + binary flags. Always run fresh and overwrite cache
@@ -534,6 +545,7 @@ class MainWindow(QMainWindow):
             system_flags = probe_gpu_support(None)
 
         self._system_flags = system_flags
+        print(f"[GPU PROBE] vendor={system_flags.get('vendor')}, gpus={system_flags.get('gpus')}, flash_attn={system_flags.get('flash_attn')}")
 
         # Update status bar
         vendor = system_flags.get("vendor")
