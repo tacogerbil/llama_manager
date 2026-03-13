@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QTimer, QProcess, QThread, Signal
 from PySide6.QtGui import QTextCursor, QIntValidator
 
 # Import existing logic
-from scripts.config import load_config, save_config
+from scripts.config import load_config, save_config, CACHE_DIR
 from scripts.quantize_merge import list_models
 from scripts.detectors import probe_gpu_support, detect_model_family
 from scripts.gguf_parser import find_projector_file, get_model_architecture, list_projector_candidates
@@ -504,40 +504,38 @@ class MainWindow(QMainWindow):
         self.update_vram_display()
     
     def _startup_probe_gpu(self):
-        """Probe GPU at startup and show result in status bar. nvidia-smi works without bin_path."""
-        import json
-        import socket
-        from pathlib import Path
-        from scripts.detectors import probe_gpu_support
-        from scripts.config import CACHE_DIR
-
+        """
+        Probe GPU + binary flags at startup.
+        - Always probes fresh when bin_path is set (so flash_attn is correct).
+        - Falls back to GPU-only probe (nvidia-smi) when bin_path is not set.
+        - Populates the Launch page GPU checkboxes immediately.
+        - Only writes cache when bin_path is set (full probe), so model selection
+          re-probes correctly if bin_path was empty at startup.
+        """
         hostname = socket.gethostname()
         cache_file = CACHE_DIR / f"{hostname}_system_flags.json"
+        bin_path = self.cfg.get("bin_path", "")
 
-        # Use cached flags if valid, otherwise probe now
-        system_flags = None
-        if cache_file.exists():
-            try:
-                with open(cache_file) as f:
-                    system_flags = json.load(f)
-                # Re-probe if cache has no GPU info
-                if not system_flags.get("vendor"):
-                    system_flags = None
-            except Exception:
-                system_flags = None
-
-        if system_flags is None:
-            server_bin = os.path.join(self.cfg.get("bin_path", ""), "llama-server")
+        if bin_path:
+            # Full probe: GPU + binary flags. Always run fresh and overwrite cache
+            # so flash_attn reflects the actual binary.
+            server_bin = os.path.join(bin_path, "llama-server")
             if os.name == "nt":
                 server_bin += ".exe"
-            system_flags = probe_gpu_support(server_bin if self.cfg.get("bin_path") else None)
+            system_flags = probe_gpu_support(server_bin)
             try:
                 with open(cache_file, "w") as f:
                     json.dump(system_flags, f, indent=4)
             except Exception:
                 pass
+        else:
+            # No bin_path yet — GPU-only probe for display, do NOT write cache.
+            # This ensures model selection triggers a full probe once bin_path is set.
+            system_flags = probe_gpu_support(None)
 
-        # Show GPU summary in status bar
+        self._system_flags = system_flags
+
+        # Update status bar
         vendor = system_flags.get("vendor")
         if vendor:
             gpus = system_flags.get("gpus", [])
@@ -551,8 +549,44 @@ class MainWindow(QMainWindow):
             self.status_lbl.setText("No GPU detected")
             self.status_lbl.setStyleSheet("color: #ffc107; font-size: 12px; padding: 0 10px;")
 
+        # Populate GPU checkboxes in Launch page immediately (before model selection)
+        self._populate_gpu_group(system_flags.get("gpus", []))
+
+    def _populate_gpu_group(self, gpus: list, selected_indices=None):
+        """Populate the Active GPUs group from a gpus list directly."""
+        while self.gpu_layout.count():
+            item = self.gpu_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.gpu_checks = []
+
+        if not gpus:
+            lbl = QLabel("No GPU info available")
+            lbl.setStyleSheet("color: #666; font-style: italic;")
+            self.gpu_layout.addWidget(lbl)
+            return
+
+        for gpu in gpus:
+            name = gpu.get("name", f"GPU {gpu['index']}")
+            vram = gpu.get("vram_gb", 0)
+            cb = QCheckBox(f"GPU {gpu['index']}: {name} ({vram:.2f} GB)")
+            if selected_indices is not None:
+                cb.setChecked(gpu["index"] in selected_indices)
+            else:
+                cb.setChecked(True)
+            cb.stateChanged.connect(self.update_vram_display)
+            self.gpu_layout.addWidget(cb)
+            self.gpu_checks.append((gpu, cb))
+
     def _on_paths_saved(self):
         """Reload model list and reset selection after bin/model paths are changed."""
+        # Wipe system flags cache so model selection does a full fresh probe
+        cache_file = CACHE_DIR / f"{socket.gethostname()}_system_flags.json"
+        try:
+            cache_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
         self.models = list_models(self.cfg)
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
@@ -561,7 +595,7 @@ class MainWindow(QMainWindow):
         self.model_combo.blockSignals(False)
         self.current_model = None
         self.model_info_lbl.setText("Select a model...")
-        # Re-probe with potentially new bin_path
+        # Re-probe with new bin_path (full probe now that bin_path is set)
         self._startup_probe_gpu()
 
     def refresh_model_list(self):
@@ -700,37 +734,12 @@ class MainWindow(QMainWindow):
         self.update_vram_display()
 
     def refresh_gpu_list(self, selected_indices=None):
-        # Clear existing layout items
-        while self.gpu_layout.count():
-            item = self.gpu_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-            
-        self.gpu_checks = []
-        # Get detected GPUs from capabilities (detectors.py)
-        gpus = self.caps.get('system_flags', {}).get('gpus', [])
-        
-        if not gpus:
-             lbl = QLabel("No detailed GPU info available (using basic detection)")
-             lbl.setStyleSheet("color: #666; font-style: italic;")
-             self.gpu_layout.addWidget(lbl)
-             return 
-
-        for gpu in gpus:
-            name = gpu.get('name', f"GPU {gpu['index']}")
-            vram = gpu.get('vram_gb', 0)
-            cb = QCheckBox(f"GPU {gpu['index']}: {name} ({vram:.2f} GB)")
-            
-            # Determine checked state
-            if selected_indices is not None:
-                cb.setChecked(gpu['index'] in selected_indices)
-            else:
-                cb.setChecked(True) # Default to all enabled if no pref
-            
-            cb.stateChanged.connect(self.update_vram_display)
-            self.gpu_layout.addWidget(cb)
-            # Store reference to GPU data and the checkbox
-            self.gpu_checks.append((gpu, cb))
+        # Prefer caps (set after model selection), fall back to startup probe result
+        if hasattr(self, 'caps'):
+            gpus = self.caps.get('system_flags', {}).get('gpus', [])
+        else:
+            gpus = getattr(self, '_system_flags', {}).get('gpus', [])
+        self._populate_gpu_group(gpus, selected_indices)
 
     def update_vram_display(self):
         if not self.current_model: return
