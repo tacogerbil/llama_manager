@@ -111,6 +111,10 @@ def probe_gpu_support(binary_path: str = None, debug: bool = False) -> Dict[str,
                 ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
                 capture_output=True, text=True
             )
+            if debug:
+                print(f"nvidia-smi returncode={out.returncode}")
+                print(f"nvidia-smi stdout={repr(out.stdout)}")
+                print(f"nvidia-smi stderr={repr(out.stderr)}")
             if out.returncode == 0 and out.stdout.strip():
                 if out.returncode == 0 and out.stdout.strip():
                     lines = out.stdout.strip().split("\n")

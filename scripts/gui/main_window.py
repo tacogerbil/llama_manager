@@ -533,7 +533,7 @@ class MainWindow(QMainWindow):
             server_bin = os.path.join(bin_path, "llama-server")
             if os.name == "nt":
                 server_bin += ".exe"
-            system_flags = probe_gpu_support(server_bin)
+            system_flags = probe_gpu_support(server_bin, debug=True)
             try:
                 with open(cache_file, "w") as f:
                     json.dump(system_flags, f, indent=4)
@@ -542,7 +542,7 @@ class MainWindow(QMainWindow):
         else:
             # No bin_path yet — GPU-only probe for display, do NOT write cache.
             # This ensures model selection triggers a full probe once bin_path is set.
-            system_flags = probe_gpu_support(None)
+            system_flags = probe_gpu_support(None, debug=True)
 
         self._system_flags = system_flags
         print(f"[GPU PROBE] vendor={system_flags.get('vendor')}, gpus={system_flags.get('gpus')}, flash_attn={system_flags.get('flash_attn')}")
