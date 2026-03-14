@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import subprocess
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QLabel, QComboBox, QSlider, QScrollArea,
@@ -13,7 +14,6 @@ from scripts.quantize_merge import list_models
 from scripts.detectors import probe_gpu_support, detect_model_family
 from scripts.gguf_parser import find_projector_file, get_model_architecture, list_projector_candidates
 from scripts.vram_calculator import calculate_vram_usage, get_vram_available
-from scripts.tui import get_model_capabilities, get_safe_defaults
 from scripts.tui import get_model_capabilities, get_safe_defaults
 from scripts.services.command_builder import ServerCommandBuilder, VisionConfig
 from scripts.gui.widgets import VramBar, Card
@@ -309,7 +309,6 @@ class MainWindow(QMainWindow):
         self.ctx_slider = QSlider(Qt.Horizontal)
         self.ctx_slider.setRange(512, 32768)
         self.ctx_slider.setSingleStep(512)
-        self.ctx_slider.setSingleStep(512)
         self.ctx_slider.valueChanged.connect(self.update_ctx_input)
         self.ctx_slider.valueChanged.connect(self.update_vram_display)
         self.ctx_input = QLineEdit("2048")
@@ -339,10 +338,31 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.cache_combo, 2, 1)
         
         
-        # Flash Attention
+        # Context size quick-select presets
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(4)
+        for label, val in [("4K", 4096), ("8K", 8192), ("16K", 16384), ("32K", 32768)]:
+            btn = QPushButton(label)
+            btn.setFixedWidth(42)
+            btn.setStyleSheet("QPushButton { padding: 2px; background: #3d3d3d; border: 1px solid #555; border-radius: 3px; } QPushButton:hover { background: #4d4d4d; }")
+            btn.clicked.connect(lambda _, v=val: (self.ctx_slider.setValue(v), self.ctx_input.setText(str(v))))
+            preset_row.addWidget(btn)
+        preset_row.addStretch()
+        grid.addLayout(preset_row, 0, 3)
+
+        # Flash Attention + force-override
+        flash_row = QHBoxLayout()
         self.flash_check = QCheckBox("Flash Attention")
         self.flash_check.toggled.connect(self.update_vram_display)
-        grid.addWidget(self.flash_check, 3, 0, 1, 2)
+        flash_row.addWidget(self.flash_check)
+        self.flash_force_check = QCheckBox("Force")
+        self.flash_force_check.setStyleSheet("color: #ffc107;")
+        self.flash_force_check.setToolTip("Force-enable flash attention even if probe says unsupported.\nUse if you know your binary supports it.")
+        self.flash_force_check.setVisible(False)
+        self.flash_force_check.toggled.connect(self._on_flash_force_toggled)
+        flash_row.addWidget(self.flash_force_check)
+        flash_row.addStretch()
+        grid.addLayout(flash_row, 3, 0, 1, 2)
         
         scroll_layout.addWidget(settings_group)
 
@@ -359,7 +379,42 @@ class MainWindow(QMainWindow):
         
         # GPU Selection
         self.gpu_group = QGroupBox("Active GPUs")
-        self.gpu_layout = QVBoxLayout(self.gpu_group) # Vertical list of checkboxes
+        self.gpu_layout = QVBoxLayout(self.gpu_group)
+        self.gpu_layout.setSpacing(6)
+
+        # Tensor split slider (hidden until exactly 2 GPUs are checked)
+        self.split_container = QWidget()
+        split_v = QVBoxLayout(self.split_container)
+        split_v.setContentsMargins(0, 8, 0, 0)
+        split_v.setSpacing(4)
+
+        split_hdr = QLabel("Tensor Split")
+        split_hdr.setStyleSheet("font-weight: bold; color: #aaa;")
+        split_v.addWidget(split_hdr)
+
+        split_row = QHBoxLayout()
+        self.split_lbl_left  = QLabel("GPU 0")
+        self.split_lbl_right = QLabel("GPU 1")
+        self.split_lbl_right.setAlignment(Qt.AlignRight)
+        self.split_slider = QSlider(Qt.Horizontal)
+        self.split_slider.setRange(0, 100)
+        self.split_slider.setValue(50)
+        self.split_slider.setTickInterval(10)
+        self.split_slider.setTickPosition(QSlider.TicksBelow)
+        self.split_slider.valueChanged.connect(self._on_split_changed)
+        split_row.addWidget(self.split_lbl_left,  1)
+        split_row.addWidget(self.split_slider,     4)
+        split_row.addWidget(self.split_lbl_right,  1)
+        split_v.addLayout(split_row)
+
+        self.split_value_lbl = QLabel("50% / 50%")
+        self.split_value_lbl.setAlignment(Qt.AlignCenter)
+        self.split_value_lbl.setStyleSheet("color: #aaa; font-size: 12px;")
+        split_v.addWidget(self.split_value_lbl)
+
+        self.split_container.hide()
+        self.gpu_layout.addWidget(self.split_container)
+
         scroll_layout.addWidget(self.gpu_group)
         
         # Network & Security
@@ -525,7 +580,6 @@ class MainWindow(QMainWindow):
         hostname = socket.gethostname()
         cache_file = CACHE_DIR / f"{hostname}_system_flags.json"
         bin_path = self.cfg.get("bin_path", "")
-        print(f"[GPU PROBE] hostname={hostname}, bin_path={repr(bin_path)}")
 
         if bin_path:
             # Full probe: GPU + binary flags. Always run fresh and overwrite cache
@@ -533,7 +587,7 @@ class MainWindow(QMainWindow):
             server_bin = os.path.join(bin_path, "llama-server")
             if os.name == "nt":
                 server_bin += ".exe"
-            system_flags = probe_gpu_support(server_bin, debug=True)
+            system_flags = probe_gpu_support(server_bin)
             try:
                 with open(cache_file, "w") as f:
                     json.dump(system_flags, f, indent=4)
@@ -542,10 +596,9 @@ class MainWindow(QMainWindow):
         else:
             # No bin_path yet — GPU-only probe for display, do NOT write cache.
             # This ensures model selection triggers a full probe once bin_path is set.
-            system_flags = probe_gpu_support(None, debug=True)
+            system_flags = probe_gpu_support(None)
 
         self._system_flags = system_flags
-        print(f"[GPU PROBE] vendor={system_flags.get('vendor')}, gpus={system_flags.get('gpus')}, flash_attn={system_flags.get('flash_attn')}")
 
         # Update status bar
         vendor = system_flags.get("vendor")
@@ -566,29 +619,58 @@ class MainWindow(QMainWindow):
 
     def _populate_gpu_group(self, gpus: list, selected_indices=None):
         """Populate the Active GPUs group from a gpus list directly."""
-        while self.gpu_layout.count():
-            item = self.gpu_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        # Remove everything except the persistent split_container
+        for i in reversed(range(self.gpu_layout.count())):
+            item = self.gpu_layout.itemAt(i)
+            w = item.widget() if item else None
+            if w and w is not self.split_container:
+                self.gpu_layout.takeAt(i)
+                w.deleteLater()
         self.gpu_checks = []
 
         if not gpus:
             lbl = QLabel("No GPU info available")
             lbl.setStyleSheet("color: #666; font-style: italic;")
-            self.gpu_layout.addWidget(lbl)
+            self.gpu_layout.insertWidget(0, lbl)
+            self.split_container.hide()
             return
 
-        for gpu in gpus:
+        for i, gpu in enumerate(gpus):
             name = gpu.get("name", f"GPU {gpu['index']}")
             vram = gpu.get("vram_gb", 0)
-            cb = QCheckBox(f"GPU {gpu['index']}: {name} ({vram:.2f} GB)")
+            vram_str = f"{vram:.2f} GB" if vram else "VRAM unknown"
+            cb = QCheckBox(f"GPU {gpu['index']}: {name}  ({vram_str})")
             if selected_indices is not None:
                 cb.setChecked(gpu["index"] in selected_indices)
             else:
                 cb.setChecked(True)
             cb.stateChanged.connect(self.update_vram_display)
-            self.gpu_layout.addWidget(cb)
+            cb.stateChanged.connect(self._update_split_visibility)
+            self.gpu_layout.insertWidget(i, cb)
             self.gpu_checks.append((gpu, cb))
+
+        self._update_split_visibility()
+
+    def _on_flash_force_toggled(self, checked: bool):
+        self.flash_check.setEnabled(checked)
+        if checked:
+            self.flash_check.setChecked(True)
+
+    def _update_split_visibility(self):
+        """Show tensor-split slider only when exactly 2 GPUs are checked."""
+        checked = [(gpu, cb) for gpu, cb in self.gpu_checks if cb.isChecked()]
+        if len(checked) == 2:
+            g0 = checked[0][0].get("name", "GPU 0").split()[-1]
+            g1 = checked[1][0].get("name", "GPU 1").split()[-1]
+            self.split_lbl_left.setText(g0)
+            self.split_lbl_right.setText(g1)
+            self.split_container.show()
+        else:
+            self.split_container.hide()
+
+    def _on_split_changed(self, value: int):
+        self.split_value_lbl.setText(f"{value}% / {100 - value}%")
+        self.update_vram_display()
 
     def _on_paths_saved(self):
         """Reload model list and reset selection after bin/model paths are changed."""
@@ -707,16 +789,21 @@ class MainWindow(QMainWindow):
         total_layers = self.arch_info.get('n_layers', 100)
         saved = self.cfg.get("model_defaults", {}).get(model_name)
 
+        # flash_check state: always reflect whether binary actually supports it.
+        # Force-override checkbox lets user bypass the probe result.
+        flash_supported = self.caps['flash_ok']
+        self.flash_check.setEnabled(flash_supported or self.flash_force_check.isChecked())
+        self.flash_force_check.setVisible(not flash_supported)
+
         if saved:
             self.ctx_slider.setValue(int(saved.get("ctx_size", self.safe_defaults['ctx_size'])))
             self.gpu_slider.setValue(int(saved.get("gpu_layers", total_layers)))
 
             flash_val = saved.get("flash_attention", "off")
             is_flash_on = (flash_val == "on" or flash_val is True)
-            self.flash_check.setChecked(is_flash_on if self.caps['flash_ok'] else False)
+            self.flash_check.setChecked(is_flash_on and (flash_supported or self.flash_force_check.isChecked()))
 
             self.cache_combo.setCurrentText(saved.get("cache_type", self.safe_defaults['cache_type']))
-
             self.port_input.setText(str(saved.get("port", "")))
             self.api_key_input.setText(str(saved.get("api_key", "")))
 
@@ -727,15 +814,11 @@ class MainWindow(QMainWindow):
 
             self.vision_settings_widget.load_defaults(saved, model_name)
             selected_gpus = saved.get("selected_gpus")
+            self.split_slider.setValue(saved.get("tensor_split", 50))
         else:
             self.ctx_slider.setValue(self.safe_defaults['ctx_size'])
             self.gpu_slider.setValue(total_layers)
-
-            self.flash_check.setEnabled(self.caps['flash_ok'])
-            self.flash_check.setChecked(
-                self.caps['flash_ok'] and self.safe_defaults['flash_attention'] != 'off'
-            )
-
+            self.flash_check.setChecked(flash_supported and self.safe_defaults['flash_attention'] != 'off')
             self.cache_combo.setCurrentText(self.safe_defaults['cache_type'])
             self.port_input.clear()
             self.api_key_input.clear()
@@ -844,6 +927,13 @@ class MainWindow(QMainWindow):
              if vision_data:
                  vision_config = VisionConfig.from_dict(vision_data)
 
+        # Tensor split: only when 2 GPUs checked and slider is visible
+        tensor_split_arg = None
+        if self.split_container.isVisible():
+            v = self.split_slider.value()
+            if v != 50:  # Only pass -ts when not perfectly equal
+                tensor_split_arg = f"{v/100:.2f},{(100-v)/100:.2f}"
+
         builder = ServerCommandBuilder(self.cfg)
         cmd = builder.build(
             model_file=self.current_model,
@@ -852,11 +942,13 @@ class MainWindow(QMainWindow):
             flash=self.flash_check.isChecked(),
             cache=self.cache_combo.currentText() != "f16",
             cache_type=self.cache_combo.currentText(),
-            extra_args=f"--port {port}", 
+            extra_args="",
             projector_file=self.current_projector,
+            port=str(port),
             api_key=api_key,
             host=host_arg,
-            vision_config=vision_config
+            vision_config=vision_config,
+            tensor_split=tensor_split_arg
         )
         
         # Build Environment
@@ -891,7 +983,8 @@ class MainWindow(QMainWindow):
             "port": self.port_input.text().strip(),
             "api_key": self.api_key_input.text().strip(),
             "host": self.host_check.isChecked(),
-            "selected_gpus": [int(x) for x in selected_indices]
+            "selected_gpus": [int(x) for x in selected_indices],
+            "tensor_split": self.split_slider.value() if self.split_container.isVisible() else 50
         }
         
         # Save Vision Settings (Mix-in)

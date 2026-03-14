@@ -112,9 +112,7 @@ def probe_gpu_support(binary_path: str = None, debug: bool = False) -> Dict[str,
                 capture_output=True, text=True
             )
             if debug:
-                print(f"nvidia-smi returncode={out.returncode}")
-                print(f"nvidia-smi stdout={repr(out.stdout)}")
-                print(f"nvidia-smi stderr={repr(out.stderr)}")
+                print(f"nvidia-smi returncode={out.returncode}, stdout={repr(out.stdout[:120])}")
             if out.returncode == 0 and out.stdout.strip():
                 if out.returncode == 0 and out.stdout.strip():
                     lines = out.stdout.strip().split("\n")
@@ -150,6 +148,29 @@ def probe_gpu_support(binary_path: str = None, debug: bool = False) -> Dict[str,
                         return flags
     except Exception as e:
         if debug: print(f"NVIDIA detection failed: {e}")
+
+    # lspci fallback — detects GPU name even when nvidia-smi is broken (driver mismatch etc.)
+    if not flags.get("vendor") and platform.system() == "Linux":
+        try:
+            import re
+            out = subprocess.run(["lspci"], capture_output=True, text=True, timeout=5)
+            if out.returncode == 0:
+                for line in out.stdout.splitlines():
+                    ll = line.lower()
+                    if "nvidia" in ll and any(k in ll for k in ["vga", "3d", "display"]):
+                        desc = line.split(":", 2)[-1].strip()
+                        match = re.search(r'\[([^\]]+)\]', desc)
+                        name = match.group(1) if match else desc
+                        flags["vendor"] = "NVIDIA"
+                        flags["name"] = name
+                        flags["vram_gb"] = 0  # Unknown — nvidia-smi unavailable
+                        flags["gpus"] = [{"index": 0, "name": name, "vram_gb": 0}]
+                        # cuda stays False — driver is broken, offload won't work
+                        if debug:
+                            print(f"GPU detected via lspci (nvidia-smi unavailable): {name}")
+                        return flags
+        except Exception as e:
+            if debug: print(f"lspci fallback failed: {e}")
 
     # AMD / ROCm detection
     try:

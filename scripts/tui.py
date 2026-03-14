@@ -21,9 +21,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-# Force terminal output to ensure visibility on all systems
 console = Console(force_terminal=True)
-print("Initializing Llama Manager TUI...", flush=True)
 
 
 def cleanup_cache_directories():

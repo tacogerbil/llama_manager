@@ -37,21 +37,22 @@ class ServerCommandBuilder:
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
 
-    def build(self, 
-              model_file: str, 
-              ctx_size: int, 
+    def build(self,
+              model_file: str,
+              ctx_size: int,
               gpu_layers: str,
-              flash: bool, 
-              cache: bool, 
-              cache_type: str, 
+              flash: bool,
+              cache: bool,
+              cache_type: str,
               extra_args: str,
-              ngl_override: Optional[str] = None, 
+              ngl_override: Optional[str] = None,
               cache_dir: Optional[str] = None,
-              host: Optional[str] = None, 
-              port: Optional[str] = None, 
-              api_key: Optional[str] = None, 
-              projector_file: Optional[str] = None, 
-              vision_config: Optional[VisionConfig] = None) -> List[str]:
+              host: Optional[str] = None,
+              port: Optional[str] = None,
+              api_key: Optional[str] = None,
+              projector_file: Optional[str] = None,
+              vision_config: Optional[VisionConfig] = None,
+              tensor_split: Optional[str] = None) -> List[str]:
         
         # 1. Base Command
         server_path = os.path.join(self.cfg["bin_path"], "llama-server")
@@ -87,6 +88,9 @@ class ServerCommandBuilder:
 
         if ctx_size:
             cmd.extend(["--ctx-size", str(ctx_size)])
+
+        if tensor_split:
+            cmd.extend(["-ts", tensor_split])
 
         if flash:
             cmd.extend(["-fa", "on"])
